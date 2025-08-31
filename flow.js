@@ -8,6 +8,7 @@ import FormData from "form-data";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 import { SarvamAIClient } from "sarvamai";
+import { franc } from "franc";
 
 dotenv.config();
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -19,12 +20,16 @@ const NGROK_URL = (process.env.NGROK_URL || "").replace(/\/+$/, "");
 const audioDir = path.join(process.cwd(), "audio");
 if (!fs.existsSync(audioDir)) fs.mkdirSync(audioDir);
 
-// Sarvam client for TTS (REST for STT stays below)
+// Sarvam client for TTS (we will use REST for STT to force translate=false)
 const sarvam = new SarvamAIClient({
 apiSubscriptionKey: process.env.SARVAM_API_KEY
 });
 
-// --- Twilio basic auth for recording download ---
+// small helpers
+function log(...args) { console.log(...args); }
+function warn(...args) { console.warn(...args); }
+
+// --- Twilio auth header for recording download ---
 function twilioAuthHeader() {
 const sid = process.env.TWILIO_SID;
 const token = process.env.TWILIO_AUTH;
@@ -32,7 +37,7 @@ if (!sid || !token) return null;
 return "Basic " + Buffer.from(`${sid}:${token}`).toString("base64");
 }
 
-// --- Download Twilio recording (try base url, .wav, .mp3) ---
+// --- Download Twilio recording ---
 async function downloadRecording(recordingUrl, outDir, recordingSid) {
 const attempts = [recordingUrl, `${recordingUrl}.wav`, `${recordingUrl}.mp3`];
 const auth = twilioAuthHeader();
@@ -40,128 +45,190 @@ if (!auth) throw new Error("TWILIO_SID or TWILIO_AUTH missing in .env");
 
 for (const url of attempts) {
 try {
-console.log("Attempt download:", url);
+log("Attempt download:", url);
 const res = await fetch(url, { headers: { Authorization: auth }, timeout: 20000 });
 if (!res.ok) {
-console.log("recording fetch not ok", url, res.status);
+log("recording fetch not ok", url, res.status);
 continue;
 }
 const buffer = await res.buffer();
-const outPath = path.join(outDir, `${recordingSid}_raw`);
+const outPath = path.join(outDir, `${recordingSid}_raw.wav`);
 fs.writeFileSync(outPath, buffer);
-console.log("Downloaded recording to:", outPath);
+log("Downloaded recording to:", outPath);
 return outPath;
 } catch (err) {
-console.log("download attempt error:", err && err.message ? err.message : err);
+log("download attempt error:", err?.message || err);
 }
 }
 throw new Error("Could not download recording from Twilio (checked variations).");
 }
 
-// --- Convert any input to 16k mono WAV (for STT) ---
+// --- Convert to 16k mono WAV ---
 function convertTo16kMono(inputPath, outPath) {
 return new Promise((resolve, reject) => {
 ffmpeg(inputPath)
-.audioFrequency(16000)
-.audioChannels(1)
+.outputOptions(["-ar 16000", "-ac 1", "-y"])
 .format("wav")
 .on("error", (err) => {
 console.error("FFmpeg error:", err);
 reject(err);
 })
 .on("end", () => {
-console.log("Converted to 16k mono WAV:", outPath);
+log("Converted to 16k mono WAV:", outPath);
 resolve(outPath);
 })
 .save(outPath);
 });
 }
 
-// --- Sarvam STT via REST (multipart/form-data) ---
-async function sarvamSTT(wavFilePath) {
-const url = "https://api.sarvam.ai/speech-to-text"; // correct endpoint
+// --- Helpers for language normalization/override ---
+
+function normalizeLangCode(code) {
+if (!code) return "unknown";
+const lc = String(code).toLowerCase();
+if (lc.startsWith("gu")) return "gu-IN";
+if (lc.startsWith("hi")) return "hi-IN";
+if (lc.startsWith("en")) return "en-IN";
+if (lc.startsWith("bn")) return "bn-IN";
+if (lc.startsWith("kn")) return "kn-IN";
+if (lc.startsWith("ml")) return "ml-IN";
+if (lc.startsWith("mr")) return "mr-IN";
+if (lc.startsWith("od")) return "od-IN";
+if (lc.startsWith("pa")) return "pa-IN";
+if (lc.startsWith("ta")) return "ta-IN";
+if (lc.startsWith("te")) return "te-IN";
+return code;
+}
+
+function detectLanguageLocal(text) {
+if (!text || text.trim().length === 0) return "en-IN";
+if (/[\u0A80-\u0AFF]/.test(text)) return "gu-IN"; // Gujarati script
+if (/[\u0900-\u097F]/.test(text)) return "hi-IN"; // Devanagari (Hindi)
+if (text.trim().length < 6) return "en-IN";
+
+const francLang = franc(text, { minLength: 3 });
+if (francLang === "guj") return "gu-IN";
+if (francLang === "hin") return "hi-IN";
+if (francLang === "eng") return "en-IN";
+return "en-IN";
+}
+
+// Romanized cues (if STT outputs Latin letters but user spoke Indic)
+const romanGujaratiRe = /\b(kem|cho|maja|majama|tame|tamne|shu|su|mane|hu|maru|bhai|barabar|krupaya|dhanyavaad)\b/i;
+const romanHindiRe = /\b(aap|aapka|kaise|naam|namaste|shukriya|haan|nahi|kya|kyu|kyun|theek|thik|bahut|kripya|dhanyavad)\b/i;
+
+function resolveFinalLang(sttLangCode, transcript) {
+const scriptGu = /[\u0A80-\u0AFF]/.test(transcript);
+const scriptHi = /[\u0900-\u097F]/.test(transcript);
+
+if (scriptGu) return "gu-IN";
+if (scriptHi) return "hi-IN";
+
+let lang = normalizeLangCode(sttLangCode);
+
+// If STT says English but romanized cues suggest otherwise, override
+if (lang === "en-IN") {
+if (romanGujaratiRe.test(transcript)) return "gu-IN";
+if (romanHindiRe.test(transcript)) return "hi-IN";
+}
+
+// If unknown, fall back to local detector
+if (!lang || lang === "unknown") {
+lang = detectLanguageLocal(transcript);
+}
+
+return lang || "en-IN";
+}
+
+// --- Sarvam STT via REST (forces translate=false) ---
+async function sarvamSTT(filePath) {
+try {
+const url = "https://api.sarvam.ai/speech-to-text";
 const model = process.env.SARVAM_STT_MODEL || "saarika:v2.5";
+
 const fd = new FormData();
-fd.append("file", fs.createReadStream(wavFilePath));
+fd.append("file", fs.createReadStream(filePath));
 fd.append("model", model);
-// latency-friendly hints (optional)
-fd.append("language_code", "en-IN");
+fd.append("language_code", "unknown"); // let Sarvam auto-detect input language
+fd.append("translate", "false"); // hard-stop any translation to English
 
 const headers = fd.getHeaders();
 headers["api-subscription-key"] = process.env.SARVAM_API_KEY;
 
-console.log("Calling Sarvam STT with model:", model);
-const res = await fetch(url, {
-method: "POST",
-headers,
-body: fd
-});
-
+log("Calling Sarvam STT with model:", model);
+const res = await fetch(url, { method: "POST", headers, body: fd });
 const json = await res.json().catch(() => null);
+
 if (!res.ok) {
 console.error("Sarvam STT error:", res.status, json);
-const err = new Error("Sarvam STT error " + (json?.error?.code || res.status));
-err.raw = json;
-throw err;
+throw new Error("Sarvam STT error");
 }
 
 const transcript =
+json?.transcript ||
 json?.text ||
 (Array.isArray(json?.results) && json.results[0]?.alternatives?.[0]?.transcript) ||
-json?.transcript ||
 "";
 
-if (!transcript) {
-console.error("Sarvam STT returned (no transcript):", json);
-throw new Error("Sarvam STT returned no transcript");
+const langCode = normalizeLangCode(json?.language_code || "unknown");
+
+if (!transcript) throw new Error("Sarvam STT returned no transcript");
+
+log("Sarvam STT transcript:", transcript);
+log("Sarvam detected language code:", langCode);
+
+return { transcript, langCode };
+} catch (err) {
+console.error("Sarvam STT error:", err?.message || err);
+return { transcript: "", langCode: "unknown" };
+}
 }
 
-console.log("Sarvam STT transcript:", transcript);
-return transcript;
-}
-
-// --- DeepSeek chat completions ---
-async function callDeepSeek(userText) {
+// --- DeepSeek chat (short replies, same language) ---
+async function callDeepSeek(userText, langCode) {
 const key = process.env.DEEPSEEK_API_KEY;
 if (!key) throw new Error("DEEPSEEK_API_KEY missing in .env");
 const model = process.env.DEEPSEEK_CHAT_MODEL || "deepseek-chat";
-const url = "https://api.deepseek.com/v1/chat/completions";
 
-const body = {
-model,
-messages: [{ role: "user", content: userText }],
-temperature: 0.3,
-max_tokens: 256
-};
-
-const res = await fetch(url, {
-method: "POST",
-headers: {
-"Authorization": `Bearer ${key}`,
-"Content-Type": "application/json"
+const messages = [
+{
+role: "system",
+content: `You are an AI assistant on a phone call.
+The user speaks in ${langCode}.
+Always reply ONLY in ${langCode}.
+Keep it short: 1 sentence only, max 20 words.`
 },
-body: JSON.stringify(body)
+{ role: "user", content: userText }
+];
+
+const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+method: "POST",
+headers: { "Authorization": `Bearer ${key}`, "Content-Type": "application/json" },
+body: JSON.stringify({ model, messages, temperature: 0.25, max_tokens: 60 })
 });
 
 const json = await res.json().catch(() => null);
-if (!res.ok) {
-console.error("DeepSeek error:", res.status, json);
-throw new Error("DeepSeek API error");
-}
-const reply = json?.choices?.[0]?.message?.content || json?.choices?.[0]?.text || json?.text;
-if (!reply) {
-console.error("DeepSeek returned no reply:", json);
-throw new Error("DeepSeek returned no text");
-}
-console.log("DeepSeek reply:", reply);
-return reply;
+if (!res.ok) throw new Error("DeepSeek API error");
+
+let reply = json?.choices?.[0]?.message?.content || "";
+if (!reply) throw new Error("DeepSeek returned no text");
+
+// Remove emojis and surrogate symbols
+reply = reply.replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, "");
+reply = reply.replace(/[\uD800-\uDFFF]/g, "");
+reply = reply.replace(/([!?.,])\1+/g, "$1");
+
+if (reply.length > 200) reply = reply.slice(0, 200) + "...";
+
+log("DeepSeek reply:", reply);
+return reply.trim();
 }
 
-// --- Sarvam TTS via SDK (unchanged) ---
-async function sarvamTTSAndSave(text, outFilePath) {
+// --- Sarvam TTS ---
+async function sarvamTTSAndSave(text, outFilePath, langCode = "en-IN") {
 const response = await sarvam.textToSpeech.convert({
 text,
-target_language_code: "en-IN",
+target_language_code: langCode,
 speaker: process.env.SARVAM_TTS_VOICE || "anushka",
 pitch: 0,
 pace: 1,
@@ -172,98 +239,109 @@ model: "bulbul:v2"
 });
 
 const base64Audio = Array.isArray(response.audios) && response.audios[0];
-if (!base64Audio) {
-console.error("No audio returned from Sarvam TTS:", response);
-throw new Error("No audio returned from Sarvam TTS");
-}
+if (!base64Audio) throw new Error("No audio returned from Sarvam TTS");
+
 const audioBuffer = Buffer.from(base64Audio, "base64");
 fs.writeFileSync(outFilePath, audioBuffer);
-console.log("Saved TTS audio:", outFilePath);
+
+log(`Saved TTS audio (${langCode}):`, outFilePath);
+return outFilePath;
 }
 
-// --- Helpers to build TwiML blocks ---
+// --- TwiML record tag ---
 function recordTagXml() {
-// finishOnKey lets caller press * to end; trim removes leading/trailing silence -> lower latency
-return `<Record action="${NGROK_URL}/recording" method="POST" maxLength="30" timeout="3" playBeep="true" finishOnKey="*" trim="trim-silence" />`;
+return `<Record action="${NGROK_URL}/recording" method="POST" maxLength="20" timeout="6" playBeep="true" finishOnKey="*" trim="trim-silence" />`;
 }
 
-// --- Twilio webhook endpoints ---
-// First hit: prompt + first Record
-app.get("/answer", (req, res) => {
-console.log("== /answer hit ==", req.query || {});
-if (!NGROK_URL) console.warn("⚠ NGROK_URL missing in .env; TwiML will have bad callback URL.");
+// --- Twilio endpoints ---
+app.use(express.urlencoded({ extended: false }));
 
+app.get("/answer", (req, res) => {
 const twiml = `
 <Response>
-<Say>Connecting you to the A I assistant. Please speak after the beep. Press star to end.</Say>
+<Say>AI assistant connected. You can speak after the beep. Press star to end.</Say>
 ${recordTagXml()}
-</Response>
-`.trim();
-
+</Response>`;
 res.type("text/xml").send(twiml);
 });
 
-// Each time Twilio finishes recording, it POSTs here.
-// We run STT -> DeepSeek -> TTS, Play reply, then LOOP into another Record.
-app.post("/recording", express.urlencoded({ extended: false }), async (req, res) => {
+app.post("/recording", async (req, res) => {
 try {
-console.log("== /recording webhook hit ==", req.body);
 const recordingUrl = req.body.RecordingUrl;
 const recordingSid = req.body.RecordingSid || ("RE" + Date.now());
 const digits = (req.body.Digits || "").trim();
 
-// If caller pressed *, end gracefully
 if (digits === "*") {
 res.type("text/xml").send(`<Response><Say>Okay, ending the call. Goodbye.</Say><Hangup/></Response>`);
 return;
 }
+if (!recordingUrl) throw new Error("No RecordingUrl in webhook");
 
-if (!recordingUrl) throw new Error("No RecordingUrl in Twilio webhook");
-
-// 1) Download recording
+// 1) Download & convert
 const rawPath = await downloadRecording(recordingUrl, audioDir, recordingSid);
-
-// 2) Convert to 16k mono wav
 const convertedPath = path.join(audioDir, `${recordingSid}_16k.wav`);
 await convertTo16kMono(rawPath, convertedPath);
 
-// 3) STT
-const transcript = await sarvamSTT(convertedPath);
+// 2) STT (no translation) + robust language resolve
+const { transcript, langCode: sttLang } = await sarvamSTT(convertedPath);
 
-// 4) DeepSeek
-console.log("Calling DeepSeek with user text...");
-const aiReply = await callDeepSeek(transcript);
+if (!transcript || transcript.trim().length === 0) {
+  console.log("⚠ No speech detected");
+  const twiml = `
+  <Response>
+    <Say>I didn’t hear anything. Please try speaking after the beep.</Say>
+    ${recordTagXml()}
+  </Response>`;
+  res.type("text/xml").send(twiml);
+  return;
+}
+const langCode = resolveFinalLang(sttLang, transcript);
+log("Final chosen language code:", langCode);
 
-// 5) TTS and save file
+// 3) DeepSeek reply
+let aiReply;
+try {
+aiReply = await callDeepSeek(transcript, langCode);
+} catch {
+aiReply = (langCode === "gu-IN") ? "માફ કરશો, કૃપા કરીને ફરી પૂછો." :
+(langCode === "hi-IN") ? "माफ करें, कृपया फिर पूछें।" :
+"Sorry, please ask again.";
+}
+
+// 4) TTS
 const outTtsPath = path.join(audioDir, `tts_${recordingSid}.wav`);
-await sarvamTTSAndSave(aiReply, outTtsPath);
+let ttsWorked = false;
+try {
+await sarvamTTSAndSave(aiReply, outTtsPath, langCode);
+ttsWorked = true;
+} catch {
+log("TTS failed, fallback to <Say>");
+}
 
-// 6) Respond TwiML: Play reply, then LOOP to another Record
+// 5) Build TwiML
 const playUrl = `${NGROK_URL}/audio/${path.basename(outTtsPath)}`;
-const twiml = `
+const twiml = ttsWorked ? `
 <Response>
 <Play>${playUrl}</Play>
 <Pause length="1"/>
-<Say>You can speak now. Press star to end.</Say>
 ${recordTagXml()}
-</Response>
-`.trim();
+</Response>` : `
+<Response>
+<Say>${aiReply}</Say>
+<Pause length="1"/>
+${recordTagXml()}
+</Response>`;
 
 res.type("text/xml").send(twiml);
 
 } catch (err) {
-console.error("❌ Sarvam/flow error:", err && err.message ? err.message : err);
-res.type("text/xml").send(`<Response><Say>Sorry, the A I failed. Please try again later.</Say><Hangup/></Response>`);
+console.error("❌ Flow error:", err?.message || err);
+res.type("text/xml").send(`<Response><Say>Sorry, the AI failed. Goodbye.</Say><Hangup/></Response>`);
 }
 });
 
-// serve audio files
+// static audio
 app.use("/audio", express.static(audioDir));
-
-// health
-app.get("/", (_req, res) => res.send("flow.js running"));
-
 app.listen(PORT, () => {
-console.log(`✅ Flow server running on http://localhost:${PORT}`);
-console.log(`✅ /answer endpoint available at ${NGROK_URL ? NGROK_URL + "/answer" : "set NGROK_URL in .env"}`);
+log(`✅ Flow server running on http://localhost:${PORT}`);
 });
